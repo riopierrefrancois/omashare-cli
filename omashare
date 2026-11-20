@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""omashare: turn a video file into a share link on your OmaShare server.
+
+  omashare login [SERVER]     sign in once (opens your browser)
+  omashare FILE [--name N]    upload FILE, print the share link, copy it
+  omashare status             show which server and account you use
+  omashare logout             forget the saved key
+
+Apps call `omashare --json FILE`. Each stdout line is one JSON event:
+  {"event":"progress","stage":"preparing"|"uploading","percent":42.0}
+  {"event":"done","id":"...","link":"https://..."}
+  {"event":"error","error":"..."}
+"""
+
+import argparse
+import http.client
+import http.server
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+
+VERSION = "0.1.0"
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omashare"
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+DEFAULT_SERVER = "http://localhost:3000"
+CHUNK = 1024 * 1024
+JSON_MODE = False
+
+
+class ShareError(Exception):
+    pass
+
+
+# ---------- output ----------
+
+def emit(obj):
+    if JSON_MODE:
+        print(json.dumps(obj), flush=True)
+
+
+def say(msg):
+    if not JSON_MODE:
+        print(msg, file=sys.stderr, flush=True)
+
+
+def progress(stage, percent):
+    if JSON_MODE:
+        emit({"event": "progress", "stage": stage, "percent": round(percent, 1)})
+    else:
+        sys.stderr.write(f"\r{stage.capitalize()}… {percent:5.1f}%")
+        sys.stderr.flush()
+
+
+# ---------- config ----------
+
+def load_config():
+    try:
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def credentials():
+    cfg = load_config()
+    server = os.environ.get("OMASHARE_SERVER") or cfg.get("server")
+    key = os.environ.get("OMASHARE_KEY") or cfg.get("api_key")
+    if not server or not key:
+        raise ShareError("Not signed in. Run: omashare login")
+    return server.rstrip("/"), key
+
+
+# ---------- login ----------
+
+def cmd_login(server):
+    server = (server or load_config().get("server") or DEFAULT_SERVER).rstrip("/")
+    result = {}
+    done = threading.Event()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if q.get("type") == ["api_key"] and q.get("api_key"):
+                result["api_key"] = q["api_key"][0]
+                result["user_id"] = q.get("user_id", [""])[0]
+                body = b"<h2>Signed in to OmaShare.</h2><p>You can close this tab.</p>"
+                self.send_response(200)
+            else:
+                body = b"<h2>Sign-in failed.</h2><p>Run omashare login again.</p>"
+                self.send_response(400)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            if result:
+                done.set()
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    url = f"{server}/api/desktop/session/request?" + urllib.parse.urlencode(
+        {"port": port, "platform": "web", "type": "api_key"}
+    )
+    print(f"Opening your browser to sign in to {server}…", file=sys.stderr)
+    print(f"If it does not open, visit:\n  {url}", file=sys.stderr)
+    webbrowser.open(url)
+
+    if not done.wait(timeout=300):
+        httpd.shutdown()
+        raise ShareError("Timed out waiting for sign-in (5 minutes).")
+    httpd.shutdown()
+
+    cfg = load_config()
+    cfg.update({"server": server, "api_key": result["api_key"], "user_id": result["user_id"]})
+    save_config(cfg)
+    print(f"Signed in. Key saved to {CONFIG_PATH}", file=sys.stderr)
+
+
+def cmd_status():
+    cfg = load_config()
+    if not cfg.get("api_key"):
+        print("Not signed in. Run: omashare login")
+        return
+    print(f"Server: {cfg.get('server')}")
+    print(f"User:   {cfg.get('user_id')}")
+
+
+def cmd_logout():
+    cfg = load_config()
+    cfg.pop("api_key", None)
+    cfg.pop("user_id", None)
+    save_config(cfg)
+    print("Signed out (server address kept).", file=sys.stderr)
+
+
+# ---------- media ----------
+
+def probe(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", path],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except FileNotFoundError:
+        raise ShareError("ffprobe is missing (install ffmpeg).")
+    except subprocess.CalledProcessError as e:
+        raise ShareError(f"Can't read {path}: {e.stderr.strip() or 'not a video'}")
+    info = json.loads(out)
+    video = next((s for s in info.get("streams", []) if s.get("codec_type") == "video"), None)
+    audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
+    if not video:
+        raise ShareError(f"{path} has no video track.")
+    fps = 30.0
+    rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "30/1"
+    try:
+        n, d = rate.split("/")
+        if float(d):
+            fps = float(n) / float(d)
+    except ValueError:
+        pass
+    return {
+        "format": info.get("format", {}).get("format_name", ""),
+        "duration": float(info.get("format", {}).get("duration") or video.get("duration") or 0),
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
+        "fps": round(fps, 3),
+        "vcodec": video.get("codec_name", ""),
+        "pix_fmt": video.get("pix_fmt", ""),
+        "acodec": audio.get("codec_name", "") if audio else None,
+    }
+
+
+def browser_ready(meta):
+    """True when the file can go up as-is: MP4 with H.264 (8-bit 4:2:0) and AAC or no audio."""
+    return (
+        "mp4" in meta["format"]
+        and meta["vcodec"] == "h264"
+        and meta["pix_fmt"] in ("yuv420p", "yuvj420p")
+        and meta["acodec"] in (None, "aac")
+    )
+
+
+def prepare(path, meta, workdir):
+    """Return a path to an MP4 every browser plays, with the index at the front."""
+    out = os.path.join(workdir, "result.mp4")
+    if browser_ready(meta):
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?",
+               "-c", "copy", "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out]
+    else:
+        say("Converting to a format every browser plays…")
+        cmd = ["ffmpeg", "-v", "error", "-y", "-i", path, "-map", "0:v:0", "-map", "0:a:0?",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart",
+               "-progress", "pipe:1", "-nostats", out]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    total_us = max(meta["duration"], 0.001) * 1_000_000
+    for line in proc.stdout:
+        if line.startswith("out_time_us="):
+            try:
+                progress("preparing", min(100.0, int(line.split("=")[1]) / total_us * 100))
+            except ValueError:
+                pass
+    err = proc.stderr.read()
+    if proc.wait() != 0:
+        raise ShareError(f"ffmpeg failed: {err.strip()[-400:]}")
+    progress("preparing", 100.0)
+    if not JSON_MODE:
+        sys.stderr.write("\n")
+    return out
+
+
+# ---------- server API ----------
+
+def api(server, key, method, path, query=None, body=None):
+    url = server + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {key}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code == 401:
+            raise ShareError("The server didn't accept your key. Run: omashare login")
+        raise ShareError(f"Server said {e.code} on {path}: {detail}")
+    except urllib.error.URLError as e:
+        raise ShareError(f"Can't reach {server}: {e.reason}")
+
+
+def put_file(url, path):
+    parts = urllib.parse.urlsplit(url)
+    conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+    conn = conn_cls(parts.netloc, timeout=120)
+    target = parts.path + ("?" + parts.query if parts.query else "")
+    size = os.path.getsize(path)
+    conn.putrequest("PUT", target, skip_accept_encoding=True)
+    conn.putheader("Content-Length", str(size))
+    conn.putheader("Content-Type", "video/mp4")
+    conn.endheaders()
+    sent, last = 0, 0.0
+    with open(path, "rb") as f:
+        while chunk := f.read(CHUNK):
+            conn.send(chunk)
+            sent += len(chunk)
+            now = time.monotonic()
+            if now - last > 0.25 or sent == size:
+                progress("uploading", sent / size * 100 if size else 100)
+                last = now
+    resp = conn.getresponse()
+    body = resp.read().decode(errors="replace")
+    conn.close()
+    if not JSON_MODE:
+        sys.stderr.write("\n")
+    if resp.status >= 300:
+        raise ShareError(f"Storage refused the upload ({resp.status}): {body[:300]}")
+
+
+def cmd_upload(path, name, copy):
+    if not os.path.isfile(path):
+        raise ShareError(f"No such file: {path}")
+    server, key = credentials()
+    meta = probe(path)
+    title = name or os.path.splitext(os.path.basename(path))[0]
+
+    with tempfile.TemporaryDirectory(prefix="omashare-") as work:
+        mp4 = prepare(path, meta, work)
+        dims = {
+            "durationInSecs": round(meta["duration"], 3),
+            "width": meta["width"],
+            "height": meta["height"],
+            "fps": meta["fps"],
+        }
+        created = api(server, key, "GET", "/api/desktop/video/create",
+                      query={"recordingMode": "desktopMP4", "name": title, **dims})
+        video_id = created["id"]
+        signed = api(server, key, "POST", "/api/upload/signed",
+                     body={"videoId": video_id, "subpath": "result.mp4", "method": "put", **dims})
+        put_file(signed["presignedPutData"]["url"], mp4)
+
+    link = created.get("share_url") or f"{server}/s/{video_id}"
+    if copy and shutil.which("wl-copy"):
+        subprocess.run(["wl-copy", link], check=False)
+    if JSON_MODE:
+        emit({"event": "done", "id": video_id, "link": link})
+    else:
+        print(link)
+        if copy and shutil.which("wl-copy"):
+            say("Link copied.")
+
+
+# ---------- main ----------
+
+def main():
+    global JSON_MODE
+    argv = sys.argv[1:]
+    commands = {"login", "logout", "status", "upload"}
+    # `omashare [--json] FILE` is the short form of `omashare [--json] upload FILE`
+    first = next((i for i, a in enumerate(argv) if not a.startswith("-")), None)
+    if first is not None and argv[first] not in commands:
+        argv.insert(first, "upload")
+
+    p = argparse.ArgumentParser(prog="omashare", description="Share a video as a link.")
+    p.add_argument("--json", action="store_true", help="JSON events on stdout (for apps)")
+    p.add_argument("--version", action="version", version=f"omashare {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+    lp = sub.add_parser("login", help="sign in to your OmaShare server")
+    lp.add_argument("server", nargs="?", help=f"server address (default {DEFAULT_SERVER})")
+    sub.add_parser("logout", help="forget the saved key")
+    sub.add_parser("status", help="show server and account")
+    up = sub.add_parser("upload", help="upload a video and print its link")
+    up.add_argument("file")
+    up.add_argument("--name", help="title shown on the share page (default: file name)")
+    up.add_argument("--no-copy", action="store_true", help="don't copy the link")
+    up.add_argument("--json", action="store_true", dest="json_sub", help=argparse.SUPPRESS)
+    args = p.parse_args(argv)
+    JSON_MODE = args.json or getattr(args, "json_sub", False)
+
+    try:
+        if args.cmd == "login":
+            cmd_login(args.server)
+        elif args.cmd == "logout":
+            cmd_logout()
+        elif args.cmd == "status":
+            cmd_status()
+        elif args.cmd == "upload":
+            cmd_upload(args.file, args.name, not args.no_copy)
+        else:
+            p.print_help()
+            return 1
+    except ShareError as e:
+        if JSON_MODE:
+            emit({"event": "error", "error": str(e)})
+        else:
+            print(f"omashare: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
