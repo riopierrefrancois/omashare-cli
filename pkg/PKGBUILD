@@ -1,0 +1,16 @@
+# Built from this checkout: cd pkg && makepkg -si
+pkgname=omashare
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Share a video as a link from your own OmaShare (Cap Web) server"
+arch=('any')
+url="https://github.com/riopierrefrancois/omashare-cli"
+license=('MIT')
+depends=('python' 'ffmpeg')
+optdepends=('wl-clipboard: copy the link to the clipboard')
+
+package() {
+  install -Dm755 "$startdir/../omashare" "$pkgdir/usr/bin/omashare"
+  install -Dm644 "$startdir/../README.md" "$pkgdir/usr/share/doc/omashare/README.md"
+  install -Dm644 "$startdir/../LICENSE" "$pkgdir/usr/share/licenses/omashare/LICENSE"
+}

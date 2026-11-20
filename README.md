@@ -20,6 +20,19 @@ The key is saved in `~/.config/omashare/config.json` (readable only by you). `OM
 
 Needs `python3` and `ffmpeg`. `wl-copy` is optional; it copies the link.
 
+## Install (Arch / Omarchy)
+
+```sh
+git clone https://github.com/riopierrefrancois/omashare-cli.git
+cd omashare-cli/pkg && makepkg -si
+```
+
+This installs `/usr/bin/omashare`. Then run `omashare login https://your-server`.
+
+## License
+
+MIT. The server, an OmaShare fork of Cap Web, is AGPLv3: https://github.com/riopierrefrancois/omashare
+
 ## For apps
 
 Run `omashare --json [--name TITLE] FILE` and read stdout line by line. Each line is one JSON event:
