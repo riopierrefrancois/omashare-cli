@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omashare"
 )
@@ -324,8 +324,10 @@ def main():
     global JSON_MODE
     argv = sys.argv[1:]
     commands = {"login", "logout", "status", "upload"}
-    # `omashare [--json] FILE` is the short form of `omashare [--json] upload FILE`
-    first = next((i for i, a in enumerate(argv) if not a.startswith("-")), None)
+    # `omashare [--json] [--name T] FILE` is the short form of `omashare [--json] upload [--name T] FILE`.
+    # "upload" goes right after the global flags, so upload's own options (--name, --no-copy) follow it.
+    global_flags = {"--json", "--version", "-h", "--help"}
+    first = next((i for i, a in enumerate(argv) if a not in global_flags), None)
     if first is not None and argv[first] not in commands:
         argv.insert(first, "upload")
 
