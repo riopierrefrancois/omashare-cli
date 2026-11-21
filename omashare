@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omashare"
 )
@@ -257,7 +257,7 @@ def api(server, key, method, path, query=None, body=None):
         raise ShareError(f"Can't reach {server}: {e.reason}")
 
 
-def put_file(url, path):
+def put_file(url, path, content_type="video/mp4", report=True):
     parts = urllib.parse.urlsplit(url)
     conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(parts.netloc, timeout=120)
@@ -265,7 +265,7 @@ def put_file(url, path):
     size = os.path.getsize(path)
     conn.putrequest("PUT", target, skip_accept_encoding=True)
     conn.putheader("Content-Length", str(size))
-    conn.putheader("Content-Type", "video/mp4")
+    conn.putheader("Content-Type", content_type)
     conn.endheaders()
     sent, last = 0, 0.0
     with open(path, "rb") as f:
@@ -273,16 +273,40 @@ def put_file(url, path):
             conn.send(chunk)
             sent += len(chunk)
             now = time.monotonic()
-            if now - last > 0.25 or sent == size:
+            if report and (now - last > 0.25 or sent == size):
                 progress("uploading", sent / size * 100 if size else 100)
                 last = now
     resp = conn.getresponse()
     body = resp.read().decode(errors="replace")
     conn.close()
-    if not JSON_MODE:
+    if report and not JSON_MODE:
         sys.stderr.write("\n")
     if resp.status >= 300:
         raise ShareError(f"Storage refused the upload ({resp.status}): {body[:300]}")
+
+
+def make_thumbnail(path, meta, workdir):
+    """One frame (1 s in, or the middle of a short video) as a JPEG, 1280 px wide at most."""
+    out = os.path.join(workdir, "screen-capture.jpg")
+    at = min(1.0, max(meta["duration"], 0) / 2)
+    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{at:.3f}", "-i", path, "-frames:v", "1",
+           "-vf", "scale='min(1280,iw)':-2", "-q:v", "3", out]
+    done = subprocess.run(cmd, capture_output=True)
+    return out if done.returncode == 0 and os.path.isfile(out) else None
+
+
+def upload_thumbnail(server, key, video_id, path, meta, workdir):
+    """The dashboard and link previews use this picture. A failure here never fails the share."""
+    try:
+        thumb = make_thumbnail(path, meta, workdir)
+        if not thumb:
+            return
+        signed = api(server, key, "POST", "/api/upload/signed",
+                     body={"videoId": video_id, "subpath": "screenshot/screen-capture.jpg", "method": "put"})
+        put_file(signed["presignedPutData"]["url"], thumb, "image/jpeg", report=False)
+    except ShareError as e:
+        if not JSON_MODE:
+            say(f"No thumbnail: {e}")
 
 
 def cmd_upload(path, name, copy):
@@ -306,6 +330,7 @@ def cmd_upload(path, name, copy):
         signed = api(server, key, "POST", "/api/upload/signed",
                      body={"videoId": video_id, "subpath": "result.mp4", "method": "put", **dims})
         put_file(signed["presignedPutData"]["url"], mp4)
+        upload_thumbnail(server, key, video_id, mp4, meta, work)
 
     link = created.get("share_url") or f"{server}/s/{video_id}"
     if copy and shutil.which("wl-copy"):

@@ -1,6 +1,6 @@
 # Built from this checkout: cd pkg && makepkg -si
 pkgname=omashare
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Share a video as a link from your own OmaShare (Cap Web) server"
 arch=('any')
