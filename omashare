@@ -360,6 +360,83 @@ def get_transcript(path, meta, workdir, transcript=None, on_progress=None):
     return cues
 
 
+# ---------- writing ----------
+
+DETAILS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "chapters": {"type": "array", "items": {"type": "object", "properties": {
+            "title": {"type": "string"}, "start": {"type": "number"},
+        }, "required": ["title", "start"]}},
+    },
+    "required": ["title", "summary", "chapters"],
+}
+
+
+def clean_details(details, duration):
+    if not isinstance(details["title"], str) or not isinstance(details["summary"], str):
+        raise ValueError("invalid writer response")
+    title = details["title"].strip()[:200]
+    summary = details["summary"].strip()
+    if not title:
+        raise ValueError("empty title")
+    chapters = []
+    for chapter in details["chapters"]:
+        start = chapter["start"]
+        if (not isinstance(start, (int, float)) or isinstance(start, bool)
+                or not 0 <= start < duration or
+                (chapters and start <= chapters[-1]["start"])):
+            continue
+        chapters.append({"title": str(chapter["title"]).strip(), "start": start})
+    if chapters:
+        chapters[0]["start"] = 0
+    return {"title": title, "summary": summary, "chapters": chapters}
+
+
+def write_details(cues, duration, fallback_name):
+    """Ask the configured writer for share-page metadata; return None on failure."""
+    writer = os.environ.get("OMASHARE_WRITER", "grok").lower()
+    if writer == "off":
+        return None
+    if writer not in ("grok", "claude"):
+        warn(f"Unknown writer {writer}; skipping summary.")
+        return None
+    prompt = (
+        "You are naming a video someone is about to share with a link. "
+        f"Below is its transcript with start times in seconds. Video length: {duration} seconds.\n"
+        "Write: a title (under 70 characters, plain everyday words, sentence case, "
+        "says what the viewer will learn or see, no emoji, no clickbait, no quotes); "
+        'a summary (2 to 4 short sentences, plain words, written to the viewer, no "In this video"); '
+        "chapters (only if the video is longer than 2 minutes: 3 to 8 chapters, "
+        "the first starts at 0, each at least 30 seconds after the previous, "
+        "starts are whole seconds taken from the transcript, short plain titles). "
+        "Use the speaker's own words where you can. Shorter videos: chapters is an empty list.\n"
+        "Transcript:\n"
+        + "\n".join(f"[{start:g}] {text}" for start, _, text in cues)
+    )
+    # Both CLIs accept the prompt on stdin, avoiding the OS argument-length limit.
+    cmd = (["grok", "-p", "--disable-web-search", "--output-format", "json",
+            "--json-schema", json.dumps(DETAILS_SCHEMA)]
+           if writer == "grok" else
+           ["claude", "-p", "--output-format", "json", "--model", "haiku"])
+    progress("writing", 0.0)
+    try:
+        with tempfile.TemporaryDirectory(prefix="omashare-writer-") as empty:
+            proc = subprocess.run(cmd, input=prompt, capture_output=True, text=True,
+                                  cwd=empty, timeout=180, check=True)
+        response = json.loads(proc.stdout)
+        details = json.loads(response["text" if writer == "grok" else "result"])
+        cleaned = clean_details(details, duration)
+        progress("writing", 100.0)
+        return cleaned
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+        warn("Couldn't write a summary: Grok didn't answer." if writer == "grok"
+             else "Couldn't write a summary: Claude didn't answer.")
+        return None
+
+
 # ---------- server API ----------
 
 def api(server, key, method, path, query=None, body=None):
