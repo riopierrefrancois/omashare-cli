@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omashare"
 )
@@ -758,7 +758,7 @@ VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 def thumbnail(video_id, url):
-    if not url or not VIDEO_ID.fullmatch(video_id):
+    if not isinstance(url, str) or not url or not VIDEO_ID.fullmatch(video_id):
         return None
     path = os.path.join(
         os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
@@ -839,8 +839,8 @@ def cmd_activity(limit, read=False, all_items=False, ids=()):
         items.append({
             "id": short(item.get("id"), 80),
             "kind": "view" if kind == "anon_view" else kind,
-            "who": short(item.get("authorName") or item.get("guestName")
-                         or item.get("anonName"), 80) or None,
+            "who": (short(item.get("authorName") or item.get("guestName")
+                          or item.get("anonName"), 80) or None) if kind != "anon_view" else None,
             "text": short(comment.get("content"), 200) if isinstance(comment, dict) else None,
             "videoId": video_id, "videoTitle": short(item.get("videoTitle"), 200),
             "link": f"{server}/s/{video_id}",

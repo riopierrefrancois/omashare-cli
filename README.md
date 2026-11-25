@@ -17,6 +17,11 @@ omashare names add "Workhive"              # keep this spelling in transcript an
 omashare names                            # list saved names
 omashare names remove "Workhive"
 omashare status                            # which server and account
+omashare recent --json                      # latest shares, counts and local thumbnails
+omashare recent --json --limit 8
+omashare activity --json                    # new comments, replies, reactions and views
+omashare activity --read ID                  # mark one or more notification IDs as seen
+omashare activity --read --all               # mark all as seen
 omashare logout
 ```
 
@@ -64,6 +69,21 @@ Run `omashare --json [--name TITLE] FILE` and read stdout line by line. Each lin
 means a details step was skipped but the upload succeeded. The exit code is 0
 on success and 1 on upload error. The link is already on the clipboard when
 `done` arrives; pass `--no-copy` to skip that.
+
+Every upload, including `--json` uploads, also writes a job file at
+`$XDG_RUNTIME_DIR/omashare/jobs/<pid>.json` (or `/tmp/omashare-$UID/jobs/`
+when no runtime directory is set). It is replaced atomically as the share
+progresses and remains in `done` or `failed` state when the command exits.
+At startup, OmaShare removes finished jobs older than ten minutes and running
+jobs whose process has gone away. A bar widget can watch these files to show
+shares in progress without depending on the command's output.
+
+`recent --json` prints an object with `server`, `dashboard`, `unread`, and
+`videos` (up to 30). Each video has its title, link, date, duration, counts,
+and a local thumbnail path when one is available. `activity --json` prints
+`unread` and `items` (up to 50). Use `activity --read --all` or
+`activity --read ID [ID ...]` to mark items as seen. These commands print
+`{"error":"…"}` and exit 1 if they cannot fetch the information.
 
 ## How it talks to the server
 

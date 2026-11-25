@@ -10,6 +10,7 @@ import time
 import unittest
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,6 +94,19 @@ class FakeServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.requests.append(("GET", self.path, None))
+        if self.path.startswith("/api/desktop/video/recent?"):
+            self.respond(self.server.recent)
+            return
+        if self.path.startswith("/api/desktop/notifications?"):
+            self.respond(self.server.activity)
+            return
+        if self.path.startswith("/thumb/"):
+            data = self.server.thumb_data
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.server.fail_create:
             deadline = time.monotonic() + 1
             while not self.server.whisper_started.exists() and time.monotonic() < deadline:
@@ -107,6 +121,8 @@ class FakeServer(BaseHTTPRequestHandler):
         if self.path == "/api/upload/signed":
             self.respond({"presignedPutData": {"url": "http://127.0.0.1:"
                           f"{self.server.server_port}/storage/{body['subpath']}"}})
+        elif self.path == "/api/desktop/notifications/read":
+            self.respond({"ok": True})
         elif self.server.fail_ai:
             self.respond({"error": "AI unavailable"}, 500)
         else:
@@ -183,6 +199,7 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         cls.http.fail_create = False
         cls.http.fail_ai = False
         cls.http.whisper_started = cls.directory / "whisper-started"
+        cls.http.thumb_data = b"\xff\xd8\xff" + b"image"
         cls.model = cls.directory / "parakeet-model"
         cls.model.mkdir()
         cls.thread = threading.Thread(target=cls.http.serve_forever, daemon=True)
@@ -206,8 +223,22 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.http.fail_create = False
         self.http.fail_ai = False
         self.http.whisper_started.unlink(missing_ok=True)
+        self.http.recent = {"unread": 2, "videos": []}
+        self.http.activity = {"unread": 2, "items": []}
+        self.http.thumb_data = b"\xff\xd8\xffimage"
         self.config = self.directory / "config" / "omashare" / "config.json"
         self.config.unlink(missing_ok=True)
+        self.runtime = self.directory / "runtime"
+        self.runtime.mkdir(exist_ok=True)
+        self.cache = self.directory / "cache"
+        self.jobs = self.runtime / "omashare" / "jobs"
+        if self.jobs.exists():
+            for job in self.jobs.iterdir():
+                job.unlink()
+        thumbs = self.cache / "omashare" / "thumbs"
+        if thumbs.exists():
+            for thumb in thumbs.iterdir():
+                thumb.unlink()
 
     def run_upload(self, *args, fail=False, whisper="whisper", extra_env=None,
                    expected_returncode=0, timeout=30):
@@ -218,7 +249,9 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
                     "OMASHARE_WHISPER_PYTHON": str(self.bin / whisper),
                     "OMASHARE_SPEECH_PYTHON": str(self.bin / "absent-parakeet"),
                     "XDG_CONFIG_HOME": str(self.directory / "config"),
-                    "OMASHARE_WRITER": "grok"})
+                     "OMASHARE_WRITER": "grok"})
+        env["XDG_RUNTIME_DIR"] = str(self.runtime)
+        env["XDG_CACHE_HOME"] = str(self.cache)
         if extra_env:
             env.update(extra_env)
         if fail:
@@ -253,7 +286,14 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.assertIn("00:00:00.000 --> 00:00:01.000\nHello", payload["vtt"])
         self.assertIn("00:00:01.000 --> 00:00:02.500\nGoodbye", payload["vtt"])
         self.assertTrue(any(event["stage"] == "transcribing" and event["percent"] > 0
-                            for event in events if event["event"] == "progress"))
+                             for event in events if event["event"] == "progress"))
+        jobs = list(self.jobs.glob("*.json"))
+        self.assertEqual(len(jobs), 1)
+        job = json.loads(jobs[0].read_text())
+        self.assertEqual(job["state"], "done")
+        self.assertEqual(job["title"], "A better name")
+        self.assertEqual(job["link"], events[-1]["link"])
+        self.assertEqual(job["file"], str(self.video))
 
     def test_keep_name_and_writer_failure(self):
         events = self.run_upload("--name", "Mine", "--keep-name")
@@ -309,6 +349,111 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.assertTrue(self.http.whisper_started.exists())
         self.assertEqual(events[-1]["event"], "error")
         self.assertFalse(any(event["event"] == "done" for event in events))
+        job = json.loads(next(self.jobs.glob("*.json")).read_text())
+        self.assertEqual(job["state"], "failed")
+        self.assertIn("500", job["error"])
+
+    def test_running_job_and_cleanup(self):
+        env = self.command_env()
+        env["OMASHARE_WHISPER_PYTHON"] = str(self.bin / "whisper")
+        process = subprocess.Popen(
+            [str(ROOT / "omashare"), "--json", "upload", str(self.video), "--no-copy"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            path = self.jobs / f"{process.pid}.json"
+            deadline = time.monotonic() + 5
+            while not path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(path.exists())
+            self.assertEqual(json.loads(path.read_text())["state"], "running")
+            stdout, stderr = process.communicate(timeout=30)
+            self.assertEqual(process.returncode, 0, stderr + stdout)
+            self.assertEqual(json.loads(path.read_text())["state"], "done")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        old = {"pid": 99999999, "state": "running"}
+        (self.jobs / "99999999.json").write_text(json.dumps(old))
+        finished = self.jobs / "12345.json"
+        finished.write_text(json.dumps({"state": "failed", "updatedAt": time.time() - 601}))
+        self.command("recent", "--json")
+        self.assertFalse(finished.exists())
+        self.assertFalse((self.jobs / "99999999.json").exists())
+        self.assertTrue(path.exists())
+
+    def test_job_write_failure_does_not_interrupt_upload(self):
+        with mock.patch.object(share.os, "replace", side_effect=OSError("read only")):
+            job = share.UploadJob(str(self.video), "Video")
+            job.update(state="done", link="local", title="Video", force=True)
+        self.assertEqual(job.data["state"], "done")
+
+    def command_env(self, signed_in=True):
+        env = os.environ.copy()
+        env.update({"XDG_CONFIG_HOME": str(self.directory / "config"),
+                    "XDG_RUNTIME_DIR": str(self.runtime),
+                    "XDG_CACHE_HOME": str(self.cache),
+                    "OMASHARE_SERVER": f"http://127.0.0.1:{self.http.server_port}",
+                    "OMASHARE_KEY": "test-key"})
+        if not signed_in:
+            env.pop("OMASHARE_SERVER")
+            env.pop("OMASHARE_KEY")
+        return env
+
+    def command(self, *args, signed_in=True, code=0):
+        done = subprocess.run([str(ROOT / "omashare"), *args],
+                              env=self.command_env(signed_in), capture_output=True, text=True)
+        self.assertEqual(done.returncode, code, done.stderr + done.stdout)
+        return json.loads(done.stdout)
+
+    def test_recent_shape_thumbnail_and_limits(self):
+        self.http.recent = {"unread": 2, "videos": [
+            {"id": "good_1", "title": "T" * 250, "createdAt": "2026-11-25T12:00:00Z",
+             "duration": 155.2, "thumbnailUrl": f"http://127.0.0.1:{self.http.server_port}/thumb/1",
+             "views": 4, "comments": 1, "reactions": 2, "unread": 1},
+            {"id": "../bad", "thumbnailUrl": "http://127.0.0.1/unsafe"},
+        ]}
+        result = self.command("recent", "--json", "--limit", "99")
+        self.assertEqual(result["unread"], 2)
+        self.assertEqual(result["dashboard"], self.command_env()["OMASHARE_SERVER"] + "/dashboard/caps")
+        self.assertEqual(len(result["videos"]), 1)
+        video = result["videos"][0]
+        self.assertEqual(video["link"], result["server"] + "/s/good_1")
+        self.assertEqual(len(video["title"]), 200)
+        self.assertEqual(Path(video["thumbnail"]).read_bytes(), self.http.thumb_data)
+        self.assertIn("limit=30", FakeServer.requests[0][1])
+        self.http.thumb_data = b"not an image"
+        (Path(video["thumbnail"])).unlink()
+        self.assertIsNone(self.command("recent", "--json")["videos"][0]["thumbnail"])
+        self.http.thumb_data = b"\x89PNG\r\n\x1a\n" + b"x" * (2 * 1024 * 1024)
+        self.assertIsNone(self.command("recent", "--json")["videos"][0]["thumbnail"])
+        self.http.thumb_data = b"\x89PNG\r\n\x1a\nok"
+        self.assertTrue(self.command("recent", "--json")["videos"][0]["thumbnail"])
+
+    def test_activity_read_and_sign_in_error(self):
+        self.http.activity = {"unread": 1, "items": [
+            {"id": "n1", "type": "anon_view", "videoId": "good_1",
+             "videoTitle": "V" * 250, "anonName": None, "comment": None,
+             "createdAt": "2026-11-25T12:00:00Z", "readAt": None},
+            {"id": "n2", "type": "comment", "videoId": "good_1",
+             "authorName": "A" * 90, "comment": {"content": "C" * 250},
+             "readAt": "2026-11-25T12:01:00Z"},
+        ]}
+        result = self.command("activity", "--json", "--limit", "70")
+        self.assertEqual(result["items"][0]["kind"], "view")
+        self.assertIsNone(result["items"][0]["who"])
+        self.assertFalse(result["items"][0]["read"])
+        self.assertEqual(len(result["items"][1]["who"]), 80)
+        self.assertEqual(len(result["items"][1]["text"]), 200)
+        self.assertEqual(len(result["items"][1]["videoTitle"]), 0)
+        self.assertIn("limit=50", FakeServer.requests[-1][1])
+        self.assertEqual(self.command("activity", "--read", "n1"), {"ok": True})
+        self.assertEqual(FakeServer.requests[-1][2], {"ids": ["n1"]})
+        self.assertEqual(self.command("activity", "--read", "--all"), {"ok": True})
+        self.assertEqual(FakeServer.requests[-1][2], {"all": True})
+        self.assertEqual(self.command("recent", "--json", signed_in=False, code=1),
+                         {"error": "Sign in to OmaShare first: run omashare login in a terminal."})
 
     def test_large_whisper_stderr_does_not_block(self):
         events = self.run_upload(whisper="noisy-whisper", timeout=5)
