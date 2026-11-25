@@ -750,6 +750,106 @@ def api(server, key, method, path, query=None, body=None):
         raise ShareError(f"Can't reach {server}: {e.reason}")
 
 
+def short(value, length):
+    return value.strip()[:length] if isinstance(value, str) else ""
+
+
+VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def thumbnail(video_id, url):
+    if not url or not VIDEO_ID.fullmatch(video_id):
+        return None
+    path = os.path.join(
+        os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+        "omashare", "thumbs", video_id + ".jpg",
+    )
+    if os.path.isfile(path):
+        return path
+    temporary = None
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = response.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024 or not (
+            data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n")
+        ):
+            return None
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), prefix=".thumb-",
+                                         delete=False) as f:
+            temporary = f.name
+            f.write(data)
+        os.replace(temporary, path)
+        return path
+    except (OSError, ValueError):
+        return None
+    finally:
+        if temporary and os.path.exists(temporary):
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def bounded_limit(value, maximum):
+    if value < 1:
+        raise ShareError("Choose a limit of at least 1.")
+    return min(value, maximum)
+
+
+def cmd_recent(limit):
+    server, key = credentials()
+    response = api(server, key, "GET", "/api/desktop/video/recent",
+                   query={"limit": bounded_limit(limit, 30)})
+    videos = []
+    for video in response.get("videos", [])[:30]:
+        video_id = video.get("id")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
+            continue
+        videos.append({
+            "id": video_id, "title": short(video.get("title"), 200),
+            "createdAt": short(video.get("createdAt"), 80),
+            "duration": video.get("duration"), "link": f"{server}/s/{video_id}",
+            "thumbnail": thumbnail(video_id, video.get("thumbnailUrl")),
+            "views": video.get("views", 0), "comments": video.get("comments", 0),
+            "reactions": video.get("reactions", 0), "unread": video.get("unread", 0),
+        })
+    print(json.dumps({"server": server, "dashboard": f"{server}/dashboard/caps",
+                      "unread": response.get("unread", 0), "videos": videos}))
+
+
+def cmd_activity(limit, read=False, all_items=False, ids=()):
+    server, key = credentials()
+    if read:
+        result = api(server, key, "POST", "/api/desktop/notifications/read",
+                     body={"all": True} if all_items else {"ids": list(ids)})
+        print(json.dumps({"ok": result.get("ok", False)}))
+        return
+    response = api(server, key, "GET", "/api/desktop/notifications",
+                   query={"limit": bounded_limit(limit, 50)})
+    items = []
+    for item in response.get("items", [])[:50]:
+        kind = item.get("type")
+        if kind not in ("comment", "reply", "reaction", "view", "anon_view"):
+            continue
+        video_id = item.get("videoId")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
+            continue
+        comment = item.get("comment")
+        items.append({
+            "id": short(item.get("id"), 80),
+            "kind": "view" if kind == "anon_view" else kind,
+            "who": short(item.get("authorName") or item.get("guestName")
+                         or item.get("anonName"), 80) or None,
+            "text": short(comment.get("content"), 200) if isinstance(comment, dict) else None,
+            "videoId": video_id, "videoTitle": short(item.get("videoTitle"), 200),
+            "link": f"{server}/s/{video_id}",
+            "createdAt": short(item.get("createdAt"), 80),
+            "read": item.get("readAt") is not None,
+        })
+    print(json.dumps({"unread": response.get("unread", 0), "items": items}))
+
+
 def put_file(url, path, content_type="video/mp4", report=True):
     parts = urllib.parse.urlsplit(url)
     conn_cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
@@ -905,7 +1005,7 @@ def main():
     global JSON_MODE
     argv = sys.argv[1:]
     clean_jobs()
-    commands = {"login", "logout", "status", "upload", "names"}
+    commands = {"login", "logout", "status", "upload", "names", "recent", "activity"}
     # `omashare [--json] [--name T] FILE` is the short form of `omashare [--json] upload [--name T] FILE`.
     # "upload" goes right after the global flags, so upload's own options (--name, --no-copy) follow it.
     global_flags = {"--json", "--version", "-h", "--help"}
@@ -924,6 +1024,15 @@ def main():
     names = sub.add_parser("names", help="list or edit spellings used in transcripts")
     names.add_argument("action", nargs="?", choices=("add", "remove"))
     names.add_argument("name", nargs="?", help="name to add or remove")
+    recent = sub.add_parser("recent", help="show your latest shares")
+    recent.add_argument("--json", action="store_true", dest="json_sub")
+    recent.add_argument("--limit", type=int, default=10)
+    activity = sub.add_parser("activity", help="show or mark new activity")
+    activity.add_argument("--json", action="store_true", dest="json_sub")
+    activity.add_argument("--limit", type=int, default=10)
+    activity.add_argument("--read", action="store_true", help="mark activity as seen")
+    activity.add_argument("--all", action="store_true", help="mark everything as seen")
+    activity.add_argument("ids", nargs="*")
     up = sub.add_parser("upload", help="upload a video and print its link")
     up.add_argument("file")
     up.add_argument("--name", help="fallback title (default: file name)")
@@ -935,6 +1044,10 @@ def main():
     args = p.parse_args(argv)
     if args.cmd == "names" and bool(args.action) != bool(args.name):
         names.error("add and remove require a NAME")
+    if args.cmd == "activity" and bool(args.all or args.ids) != bool(args.read):
+        activity.error("--read requires --all or IDs; --all and IDs require --read")
+    if args.cmd == "activity" and args.all and args.ids:
+        activity.error("choose --all or IDs, not both")
     JSON_MODE = args.json or getattr(args, "json_sub", False)
 
     try:
@@ -949,11 +1062,18 @@ def main():
         elif args.cmd == "upload":
             cmd_upload(args.file, args.name, not args.no_copy, args.transcript,
                        args.no_details, args.keep_name)
+        elif args.cmd == "recent":
+            cmd_recent(args.limit)
+        elif args.cmd == "activity":
+            cmd_activity(args.limit, args.read, args.all, args.ids)
         else:
             p.print_help()
             return 1
     except ShareError as e:
-        if JSON_MODE:
+        if args.cmd in ("recent", "activity") and JSON_MODE:
+            print(json.dumps({"error": "Sign in to OmaShare first: run omashare login in a terminal."
+                              if str(e).startswith("Not signed in.") else str(e)}))
+        elif JSON_MODE:
             emit({"event": "error", "error": str(e)})
         else:
             print(f"omashare: {e}", file=sys.stderr)
