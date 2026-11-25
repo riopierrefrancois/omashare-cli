@@ -351,6 +351,21 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.assertEqual(cues[1][2], "Next topic!")
         wav.unlink()
 
+    def test_drop_fillers(self):
+        cues = [(0, 1, "Hello everyone, I wanted to uh take some time"),
+                (1, 2, "To book, uh they're here"),
+                (2, 3, "Uh, so the umbrella and the humble drum"),
+                (3, 4, "Um."),
+                (4, 5, "the end, um."),
+                (5, 6, "yes, um, no")]
+        self.assertEqual([text for _, _, text in share.drop_fillers(cues)], [
+            "Hello everyone, I wanted to take some time",
+            "To book, they're here",
+            "So the umbrella and the humble drum",
+            "the end.",
+            "yes, no",
+        ])
+
     def test_names_replacement_and_prompt(self):
         cues = [(0, 2, "WorkHive, work hive, Work-hive, workhives and Networkhive.")]
         corrected = share.correct_names(cues, ["Workhive"])

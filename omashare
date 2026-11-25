@@ -33,7 +33,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "omashare"
 )
@@ -194,6 +194,23 @@ def correct_names(cues, names):
         pattern = re.compile(r"(?<!\w)" + r"[ -]?".join(letters) + r"(?!\w)", re.IGNORECASE)
         cues = [(start, end, pattern.sub(lambda _: name, text)) for start, end, text in cues]
     return cues
+
+
+FILLER = re.compile(r",?[ \t]*(?<!\w)(?:uh|um|uhm|umm|erm)(?!\w)[ \t]*,?", re.IGNORECASE)
+
+
+def drop_fillers(cues):
+    """Remove "uh"/"um" from transcript cues; drop cues left with no words."""
+    cleaned = []
+    for start, end, text in cues:
+        new = FILLER.sub(lambda m: ", " if m.group(0).startswith(",") else " ", text)
+        new = re.sub(r"\s+([,.?!])", r"\1", re.sub(r"\s{2,}", " ", new))
+        new = re.sub(r",+([.?!,])", r"\1", new).strip(" ,")
+        if new and text[:1].isupper():
+            new = new[0].upper() + new[1:]
+        if any(char.isalnum() for char in new):
+            cleaned.append((start, end, new))
+    return cleaned
 
 
 # ---------- media ----------
@@ -761,7 +778,7 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
                 warn("No transcript: Whisper isn't set up on this computer.")
         cues = result.get("cues")
         if cues:
-            cues = correct_names(cues, load_config().get("names", []))
+            cues = correct_names(drop_fillers(cues), load_config().get("names", []))
             details = write_details(cues, meta["duration"], title)
             body = {"videoId": video_id, "vtt": build_vtt(cues)}
             if details:

@@ -29,7 +29,7 @@ no sidecar VTT/SRT transcript, transcription uses Omaedit's faster-whisper Pytho
 and model (or `OMASHARE_WHISPER_PYTHON` and `OMASHARE_WHISPER_MODEL`; default
 model `small.en`). `OMASHARE_WRITER=grok` is the default; set it to `claude` or
 `off` to use Claude Haiku or skip AI writing. Missing tools only skip the
-transcript or summary; they do not fail the upload.
+transcript or summary; they do not fail the upload. Filler words ("uh", "um") are left out of the transcript.
 Names are saved alongside the server and key in `~/.config/omashare/config.json`.
 
 ## Install (Arch / Omarchy)
