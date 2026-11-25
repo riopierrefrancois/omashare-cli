@@ -22,6 +22,7 @@ import os
 import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -330,7 +331,30 @@ def whisper_setup():
     return python, model
 
 
-def get_transcript(path, meta, workdir, transcript=None, on_progress=None):
+class TranscriptionJob:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.cancelled = False
+        self.process = None
+
+    def start(self, cmd, **kwargs):
+        with self.lock:
+            if self.cancelled:
+                return None
+            self.process = subprocess.Popen(cmd, **kwargs)
+            return self.process
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled = True
+            if self.process and self.process.poll() is None:
+                try:
+                    os.killpg(self.process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+
+def get_transcript(path, meta, workdir, transcript=None, on_progress=None, job=None):
     """Return (start, end, text) cues, or None when no transcription is available."""
     base = os.path.splitext(path)[0]
     source = transcript or next(
@@ -351,6 +375,8 @@ def get_transcript(path, meta, workdir, transcript=None, on_progress=None):
     )
     if extracted.returncode:
         raise ShareError(f"Couldn't extract audio: {extracted.stderr.strip()[-300:]}")
+    if job and job.cancelled:
+        return None
     env = os.environ.copy()
     hf_home = os.path.expanduser("~/.local/share/omaedit/speech/hf")
     if os.path.isdir(hf_home):
@@ -360,18 +386,28 @@ def get_transcript(path, meta, workdir, transcript=None, on_progress=None):
     if shutil.which("systemd-run"):
         cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=3G", "--quiet", *cmd]
     cues = []
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, env=env) as proc:
-        for line in proc.stdout:
-            item = json.loads(line)
-            if "progress" in item:
-                if on_progress:
-                    on_progress(float(item["progress"]))
-            else:
-                cues.append((float(item["start"]), float(item["end"]), item["text"]))
-        err = proc.stderr.read()
-        if proc.wait():
-            raise ShareError(f"Whisper failed: {err.strip()[-300:]}")
+    stderr_path = os.path.join(workdir, "whisper.stderr")
+    with open(stderr_path, "wb") as stderr:
+        proc = (job or TranscriptionJob()).start(
+            cmd, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env,
+            start_new_session=True,
+        )
+        if proc is None:
+            return None
+        with proc:
+            for line in proc.stdout:
+                item = json.loads(line)
+                if "progress" in item:
+                    if on_progress:
+                        on_progress(float(item["progress"]))
+                else:
+                    cues.append((float(item["start"]), float(item["end"]), item["text"]))
+            if proc.wait():
+                with open(stderr_path, "rb") as log:
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 400))
+                    tail = log.read().decode(errors="replace").strip()
+                raise ShareError(f"Whisper failed: {tail}")
     return cues
 
 
@@ -539,16 +575,17 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
         result = {}
         updates = queue.Queue()
         worker = None
+        job = TranscriptionJob()
         if not no_details:
             def transcribe():
                 try:
                     result["cues"] = get_transcript(
-                        path, meta, work, transcript, updates.put,
+                        path, meta, work, transcript, updates.put, job,
                     )
                 except Exception as e:
                     result["error"] = str(e)
 
-            worker = threading.Thread(target=transcribe)
+            worker = threading.Thread(target=transcribe, daemon=True)
             worker.start()
         try:
             dims = {
@@ -564,21 +601,23 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
                           body={"videoId": video_id, "subpath": "result.mp4", "method": "put", **dims})
             put_file(signed["presignedPutData"]["url"], mp4)
             upload_thumbnail(server, key, video_id, mp4, meta, work)
-        finally:
-            if worker:
-                if worker.is_alive():
-                    progress("transcribing", 0.0)
-                while worker.is_alive():
-                    try:
-                        percent = updates.get(timeout=0.2)
-                        progress("transcribing", percent)
-                    except queue.Empty:
-                        pass
-                worker.join()
-                if "error" in result:
-                    warn(f"Couldn't transcribe: {result['error']}")
-                elif result.get("cues") is None and meta["acodec"] and not transcript:
-                    warn("No transcript: Whisper isn't set up on this computer.")
+        except BaseException:
+            job.cancel()
+            raise
+        if worker:
+            if worker.is_alive():
+                progress("transcribing", 0.0)
+            while worker.is_alive():
+                try:
+                    percent = updates.get(timeout=0.2)
+                    progress("transcribing", percent)
+                except queue.Empty:
+                    pass
+            worker.join()
+            if "error" in result:
+                warn(f"Couldn't transcribe: {result['error']}")
+            elif result.get("cues") is None and meta["acodec"] and not transcript:
+                warn("No transcript: Whisper isn't set up on this computer.")
         cues = result.get("cues")
         if cues:
             details = write_details(cues, meta["duration"], title)

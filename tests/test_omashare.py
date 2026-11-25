@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -67,9 +68,9 @@ class TranscriptTests(unittest.TestCase):
 class FakeServer(BaseHTTPRequestHandler):
     requests = None
 
-    def respond(self, value):
+    def respond(self, value, status=200):
         data = json.dumps(value).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -77,6 +78,12 @@ class FakeServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.requests.append(("GET", self.path, None))
+        if self.server.fail_create:
+            deadline = time.monotonic() + 1
+            while not self.server.whisper_started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.respond({"error": "creation failed"}, 500)
+            return
         self.respond({"id": "test-id", "share_url": "http://127.0.0.1/s/test-id"})
 
     def do_POST(self):
@@ -85,6 +92,8 @@ class FakeServer(BaseHTTPRequestHandler):
         if self.path == "/api/upload/signed":
             self.respond({"presignedPutData": {"url": "http://127.0.0.1:"
                           f"{self.server.server_port}/storage/{body['subpath']}"}})
+        elif self.server.fail_ai:
+            self.respond({"error": "AI unavailable"}, 500)
         else:
             self.respond({"ok": True})
 
@@ -119,6 +128,18 @@ time.sleep(0.6)
 print(json.dumps({"start":1,"end":2.5,"text":"Goodbye"}), flush=True)
 print(json.dumps({"progress":83.3}), flush=True)
 """)
+        cls.make_script("slow-whisper", """#!/usr/bin/env python3
+import os, time
+open(os.environ["FAKE_WHISPER_STARTED"], "w").close()
+time.sleep(10)
+""")
+        cls.make_script("noisy-whisper", """#!/usr/bin/env python3
+import json, os
+os.write(2, b"x" * 200000)
+print(json.dumps({"start":0,"end":1,"text":"Noisy"}), flush=True)
+print(json.dumps({"progress":50}), flush=True)
+print(json.dumps({"start":1,"end":2,"text":"Done"}), flush=True)
+""")
         cls.make_script("grok", """#!/usr/bin/env python3
 import json, os, sys
 prompt = sys.stdin.read()
@@ -129,6 +150,9 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
     "summary":"See how it works.", "chapters":[]})}))
 """)
         cls.http = ThreadingHTTPServer(("127.0.0.1", 0), FakeServer)
+        cls.http.fail_create = False
+        cls.http.fail_ai = False
+        cls.http.whisper_started = cls.directory / "whisper-started"
         cls.thread = threading.Thread(target=cls.http.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -147,22 +171,28 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
 
     def setUp(self):
         FakeServer.requests = []
+        self.http.fail_create = False
+        self.http.fail_ai = False
+        self.http.whisper_started.unlink(missing_ok=True)
 
-    def run_upload(self, *args, fail=False):
+    def run_upload(self, *args, fail=False, whisper="whisper", extra_env=None,
+                   expected_returncode=0, timeout=30):
         env = os.environ.copy()
         env.update({"PATH": f"{self.bin}:{env['PATH']}",
                     "OMASHARE_SERVER": f"http://127.0.0.1:{self.http.server_port}",
                     "OMASHARE_KEY": "test-key",
-                    "OMASHARE_WHISPER_PYTHON": str(self.bin / "whisper"),
+                    "OMASHARE_WHISPER_PYTHON": str(self.bin / whisper),
                     "OMASHARE_WRITER": "grok"})
+        if extra_env:
+            env.update(extra_env)
         if fail:
             env["FAKE_GROK_FAIL"] = "1"
         else:
             env.pop("FAKE_GROK_FAIL", None)
         done = subprocess.run([str(ROOT / "omashare"), "--json", "upload",
                                str(self.video), "--no-copy", *args], env=env,
-                              capture_output=True, text=True, timeout=30)
-        self.assertEqual(done.returncode, 0, done.stderr + done.stdout)
+                              capture_output=True, text=True, timeout=timeout)
+        self.assertEqual(done.returncode, expected_returncode, done.stderr + done.stdout)
         return [json.loads(line) for line in done.stdout.splitlines()]
 
     def test_grok_output_and_event_order(self):
@@ -184,6 +214,10 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.assertEqual(payload["title"], "A better name")
         self.assertEqual(payload["videoId"], "test-id")
         self.assertIn("WEBVTT", payload["vtt"])
+        self.assertIn("00:00:00.000 --> 00:00:01.000\nHello", payload["vtt"])
+        self.assertIn("00:00:01.000 --> 00:00:02.500\nGoodbye", payload["vtt"])
+        self.assertTrue(any(event["stage"] == "transcribing" and event["percent"] > 0
+                            for event in events if event["event"] == "progress"))
 
     def test_keep_name_and_writer_failure(self):
         events = self.run_upload("--name", "Mine", "--keep-name")
@@ -206,6 +240,46 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.assertEqual(events[-1]["title"], "tone")
         self.assertFalse(any(path == "/api/desktop/video/ai-content"
                              for _, path, _ in FakeServer.requests))
+
+    def test_missing_whisper_warns_but_completes(self):
+        events = self.run_upload(
+            extra_env={"HOME": str(self.directory / "empty-home"),
+                       "OMASHARE_WHISPER_PYTHON": ""},
+        )
+        self.assertIn({"event": "warning",
+                       "message": "No transcript: Whisper isn't set up on this computer."},
+                      events)
+        self.assertEqual(events[-1]["event"], "done")
+        self.assertFalse(any(path == "/api/desktop/video/ai-content"
+                             for _, path, _ in FakeServer.requests))
+
+    def test_ai_post_failure_warns_and_keeps_original_name(self):
+        self.http.fail_ai = True
+        events = self.run_upload("--name", "Original")
+        self.assertEqual(events[-2]["event"], "warning")
+        self.assertIn("Couldn't save transcript and summary", events[-2]["message"])
+        self.assertEqual(events[-1]["event"], "done")
+        self.assertEqual(events[-1]["title"], "Original")
+
+    def test_upload_failure_cancels_slow_whisper_without_waiting(self):
+        self.http.fail_create = True
+        started = time.monotonic()
+        events = self.run_upload(
+            whisper="slow-whisper",
+            extra_env={"FAKE_WHISPER_STARTED": str(self.http.whisper_started)},
+            expected_returncode=1, timeout=2,
+        )
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(self.http.whisper_started.exists())
+        self.assertEqual(events[-1]["event"], "error")
+        self.assertFalse(any(event["event"] == "done" for event in events))
+
+    def test_large_whisper_stderr_does_not_block(self):
+        events = self.run_upload(whisper="noisy-whisper", timeout=5)
+        self.assertEqual(events[-1]["event"], "done")
+        payload = next(body for _, path, body in FakeServer.requests
+                       if path == "/api/desktop/video/ai-content")
+        self.assertIn("Noisy", payload["vtt"])
 
 
 if __name__ == "__main__":
