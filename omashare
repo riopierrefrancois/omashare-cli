@@ -13,10 +13,12 @@ Apps call `omashare --json FILE`. Each stdout line is one JSON event:
 """
 
 import argparse
+import glob
 import http.client
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -232,6 +234,122 @@ def prepare(path, meta, workdir):
     if not JSON_MODE:
         sys.stderr.write("\n")
     return out
+
+
+# ---------- transcript ----------
+
+def parse_timestamp(value):
+    parts = value.strip().replace(",", ".").split(":")
+    if len(parts) not in (2, 3):
+        raise ValueError("invalid cue timestamp")
+    try:
+        if len(parts) == 2:
+            minutes, seconds = parts
+            return int(minutes) * 60 + float(seconds)
+        hours, minutes, seconds = parts
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except ValueError as e:
+        raise ValueError("invalid cue timestamp") from e
+
+
+def parse_transcript(path):
+    """Read VTT or SRT, including cue identifiers and multiline cue text."""
+    with open(path, encoding="utf-8-sig") as f:
+        content = f.read()
+    cues = []
+    for block in re.split(r"\n\s*\n", content.replace("\r\n", "\n").replace("\r", "\n")):
+        lines = block.strip().splitlines()
+        timing = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing is None:
+            continue
+        start, end = lines[timing].split("-->", 1)
+        try:
+            begin = parse_timestamp(start)
+            finish = parse_timestamp(end.split()[0])
+        except ValueError:
+            continue
+        text = " ".join(line.strip() for line in lines[timing + 1:] if line.strip())
+        if text and finish > begin:
+            cues.append((begin, finish, text))
+    return cues
+
+
+WHISPER_SCRIPT = """
+import json
+import sys
+from faster_whisper import WhisperModel
+model = WhisperModel(sys.argv[1], device="cpu", compute_type="int8")
+segments, _ = model.transcribe(sys.argv[2], vad_filter=True)
+duration = float(sys.argv[3])
+for segment in segments:
+    print(json.dumps({"start": segment.start, "end": segment.end,
+                      "text": segment.text.strip()}), flush=True)
+    print(json.dumps({"progress": min(100, segment.end / duration * 100)}), flush=True)
+"""
+
+
+def whisper_setup():
+    settings = {}
+    settings_path = os.path.expanduser("~/.config/omaedit/settings.json")
+    try:
+        with open(settings_path) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):
+        pass
+    python = os.environ.get("OMASHARE_WHISPER_PYTHON") or settings.get("whisperPython")
+    if not python:
+        for candidate in sorted(glob.glob(os.path.expanduser("~/.local/share/*/venv/bin/python"))):
+            if subprocess.run([candidate, "-c", "import faster_whisper"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                python = candidate
+                break
+    model = os.environ.get("OMASHARE_WHISPER_MODEL") or settings.get("whisperModel") or "small.en"
+    return python, model
+
+
+def get_transcript(path, meta, workdir, transcript=None, on_progress=None):
+    """Return (start, end, text) cues, or None when no transcription is available."""
+    base = os.path.splitext(path)[0]
+    source = transcript or next(
+        (candidate for candidate in (base + ".vtt", base + ".srt") if os.path.isfile(candidate)),
+        None,
+    )
+    if source:
+        return parse_transcript(source)
+    if not meta["acodec"]:
+        return None
+    python, model = whisper_setup()
+    if not python:
+        return None
+    wav = os.path.join(workdir, "speech.wav")
+    extracted = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", path, "-vn", "-ac", "1",
+         "-ar", "16000", wav], capture_output=True, text=True,
+    )
+    if extracted.returncode:
+        raise ShareError(f"Couldn't extract audio: {extracted.stderr.strip()[-300:]}")
+    env = os.environ.copy()
+    hf_home = os.path.expanduser("~/.local/share/omaedit/speech/hf")
+    if os.path.isdir(hf_home):
+        env["HF_HOME"] = hf_home
+    cmd = [python, "-u", "-c", WHISPER_SCRIPT, str(model), wav,
+           str(max(meta["duration"], 0.001))]
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=3G", "--quiet", *cmd]
+    cues = []
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, env=env) as proc:
+        for line in proc.stdout:
+            item = json.loads(line)
+            if "progress" in item:
+                if on_progress:
+                    on_progress(float(item["progress"]))
+            else:
+                cues.append((float(item["start"]), float(item["end"]), item["text"]))
+        err = proc.stderr.read()
+        if proc.wait():
+            raise ShareError(f"Whisper failed: {err.strip()[-300:]}")
+    return cues
 
 
 # ---------- server API ----------
