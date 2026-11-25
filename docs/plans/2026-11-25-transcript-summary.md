@@ -120,3 +120,29 @@ New `tests/test_omashare.py` (stdlib `unittest`, runs with `python3 -m unittest 
 3. With PF's go: merge `omashare/ai-content` into the fork's `main` and push (deploys), build + install `omashare` 0.2.0 pkg (PF runs `makepkg -si`), push the CLI branch.
 4. Tell the Omaedit session the final event names (`transcribing`, `writing`, `warning`, `done.title`). Omacut/Omareel: note they ignore unknown stages; wording follow-up if PF wants.
 5. Update the omarchy-setup README line for omashare if the install steps change.
+
+---
+
+## Phase B2 — Corrections after the real-video trial (2026-11-25)
+
+Trial on PF's 155 s export: faster-whisper small.en took 362 s and heard "consults" as "consoles"; Grok took 121 s. Omaedit's real default engine is **Parakeet** (the "words" add-on), which took 18 s on the same audio and heard "consults" right. `--effort low` brought Grok to 15 s with an equally good title. Both engines wrote "WorkHive" (PF spells it "Workhive").
+
+### Task B6 — Parakeet first, like Omaedit
+- When `~/.local/share/omaedit/addons/words/venv/bin/python` and `~/.local/share/omaedit/addons/words/models/parakeet/` exist (env `OMASHARE_SPEECH_PYTHON` / `OMASHARE_PARAKEET_MODEL` override), transcribe with them: `onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", path=<model dir>, quantization="int8")`, `.with_timestamps().recognize(wav)`, env `HF_HUB_OFFLINE=1`. Same 3 GB memory cap.
+- Audio longer than 5 minutes: cut the 16 kHz WAV into 5-minute pieces with ffmpeg, recognise each, add the piece's offset to its times, emit `transcribing` percent per piece.
+- Join Parakeet's sub-word tokens into words the way Omaedit does (`~/Work/omaedit/src/speech.py`, `to_words`: a new word starts on a token that begins with a space and has a letter or digit). Then group words into cues: end a cue after `.`, `?` or `!`, or when it passes 7 s or 84 characters.
+- Fall back to the existing faster-whisper path only when the add-on is missing.
+
+### Task B7 — Names spelled right
+- New optional `names` list in `~/.config/omashare/config.json` (keep the other keys when saving). `omashare names` prints it; `omashare names add NAME` / `omashare names remove NAME` edit it.
+- In transcript text, replace any case-insensitive match of a name, also allowing one space or hyphen between letters (so "WorkHive", "work hive", "Work-hive" all become "Workhive"), whole words only.
+- Add to the writer prompt: `Spell these names exactly as written: {names}.` when the list is not empty.
+
+### Task B8 — Faster Grok
+- Add `--effort low` to the grok command.
+
+### Task B9 — Tests
+Fake Parakeet python (stdout as the inline script prints it) proving the add-on is chosen over Whisper, 5-minute piece offsets, word joining and cue breaks, name replacement cases (and a near miss that must not change, e.g. "workhives"? keep: plural with s is NOT a whole-word match), names add/remove keeps `server`/`key`, `--effort low` present in the grok call.
+
+### Phase B2 gate
+Same as Phase B.
