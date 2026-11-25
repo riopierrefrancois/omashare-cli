@@ -41,6 +41,7 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_SERVER = "http://localhost:3000"
 CHUNK = 1024 * 1024
 JSON_MODE = False
+ACTIVE_JOB = None
 
 
 class ShareError(Exception):
@@ -60,6 +61,8 @@ def say(msg):
 
 
 def progress(stage, percent):
+    if ACTIVE_JOB:
+        ACTIVE_JOB.update(stage=stage, percent=round(percent, 1))
     if JSON_MODE:
         emit({"event": "progress", "stage": stage, "percent": round(percent, 1)})
     else:
@@ -68,10 +71,88 @@ def progress(stage, percent):
 
 
 def warn(message):
+    if ACTIVE_JOB:
+        ACTIVE_JOB.update(warning=message)
     if JSON_MODE:
         emit({"event": "warning", "message": message})
     else:
         say(f"Warning: {message}")
+
+
+# ---------- job files ----------
+
+def jobs_dir():
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime if runtime else f"/tmp/omashare-{os.getuid()}"
+    return os.path.join(base, "omashare", "jobs") if runtime else os.path.join(base, "jobs")
+
+
+def clean_jobs():
+    """Discard finished jobs after ten minutes and abandoned running jobs."""
+    try:
+        directory = jobs_dir()
+        for entry in os.scandir(directory):
+            if not entry.name.endswith(".json") or not entry.name[:-5].isdigit():
+                continue
+            try:
+                with open(entry.path) as f:
+                    job = json.load(f)
+                if job.get("state") in ("done", "failed"):
+                    stale = time.time() - job.get("updatedAt", 0) > 600
+                elif job.get("state") == "running":
+                    try:
+                        os.kill(int(entry.name[:-5]), 0)
+                        stale = False
+                    except ProcessLookupError:
+                        stale = True
+                    except PermissionError:
+                        stale = False
+                else:
+                    continue
+                if stale:
+                    os.unlink(entry.path)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+    except OSError:
+        pass
+
+
+class UploadJob:
+    def __init__(self, path, name):
+        now = time.time()
+        self.data = {
+            "pid": os.getpid(), "file": os.path.abspath(path), "name": name,
+            "state": "running", "stage": "preparing", "percent": 0.0,
+            "startedAt": now, "updatedAt": now,
+        }
+        self.last_write = 0.0
+        self.write(force=True)
+
+    def update(self, force=False, **fields):
+        self.data.update(fields)
+        self.write(force=force)
+
+    def write(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_write < 0.25:
+            return
+        self.last_write = now
+        self.data["updatedAt"] = time.time()
+        temporary = None
+        try:
+            directory = jobs_dir()
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", dir=directory, prefix=".job-",
+                                             delete=False) as f:
+                temporary = f.name
+                json.dump(self.data, f)
+            os.replace(temporary, os.path.join(directory, f"{os.getpid()}.json"))
+        except OSError:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
 
 # ---------- config ----------
@@ -722,6 +803,20 @@ def upload_thumbnail(server, key, video_id, path, meta, workdir):
 
 
 def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=False):
+    global ACTIVE_JOB
+    fallback = name or os.path.splitext(os.path.basename(path))[0]
+    ACTIVE_JOB = UploadJob(path, fallback)
+    try:
+        upload(path, name, copy, transcript, no_details, keep_name)
+    except BaseException as e:
+        ACTIVE_JOB.update(state="failed", error=str(e) if not isinstance(e, KeyboardInterrupt)
+                          else "Sharing was stopped.", force=True)
+        raise
+    finally:
+        ACTIVE_JOB = None
+
+
+def upload(path, name, copy, transcript=None, no_details=False, keep_name=False):
     if not os.path.isfile(path):
         raise ShareError(f"No such file: {path}")
     server, key = credentials()
@@ -795,6 +890,7 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
     link = created.get("share_url") or f"{server}/s/{video_id}"
     if copy and shutil.which("wl-copy"):
         subprocess.run(["wl-copy", link], check=False)
+    ACTIVE_JOB.update(state="done", link=link, title=title, name=title, force=True)
     if JSON_MODE:
         emit({"event": "done", "id": video_id, "link": link, "title": title})
     else:
@@ -808,6 +904,7 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
 def main():
     global JSON_MODE
     argv = sys.argv[1:]
+    clean_jobs()
     commands = {"login", "logout", "status", "upload", "names"}
     # `omashare [--json] [--name T] FILE` is the short form of `omashare [--json] upload [--name T] FILE`.
     # "upload" goes right after the global flags, so upload's own options (--name, --no-copy) follow it.
