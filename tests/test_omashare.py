@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -63,6 +64,20 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual(cleaned["summary"], "Quick guide")
         self.assertEqual(cleaned["chapters"],
                          [{"title": "First", "start": 0}, {"title": "Second", "start": 40}])
+
+    def test_parakeet_word_and_cue_boundaries(self):
+        words = share.parakeet_words(
+            [" Work", "hive", ".", " Next", " topic", "!"],
+            [0, 0.2, 0.4, 1, 1.5, 1.7], 3,
+        )
+        self.assertEqual([word[2] for word in words],
+                         ["Workhive.", "Next", "topic!"])
+        self.assertEqual([cue[2] for cue in share.words_to_cues(words)],
+                         ["Workhive.", "Next topic!"])
+        self.assertEqual(len(share.words_to_cues(
+            [(0, 1, "First"), (7, 8, "second"), (9, 10, "third")])), 2)
+        self.assertEqual(len(share.words_to_cues(
+            [(0, 1, "a" * 50), (1, 2, "b" * 40), (2, 3, "last")])), 2)
 
 
 class FakeServer(BaseHTTPRequestHandler):
@@ -140,10 +155,25 @@ print(json.dumps({"start":0,"end":1,"text":"Noisy"}), flush=True)
 print(json.dumps({"progress":50}), flush=True)
 print(json.dumps({"start":1,"end":2,"text":"Done"}), flush=True)
 """)
+        cls.make_script("parakeet", """#!/usr/bin/env python3
+import json, os, sys
+assert os.environ["HF_HUB_OFFLINE"] == "1"
+assert os.path.isdir(sys.argv[4])
+for audio in sys.argv[5:]:
+    assert os.path.isfile(audio)
+    print(json.dumps({"tokens":[" Work","hive","."," Next"," topic","!"],
+                      "timestamps":[0,0.2,0.4,1,1.5,1.7]}), flush=True)
+""")
         cls.make_script("grok", """#!/usr/bin/env python3
 import json, os, sys
+assert "--effort" in sys.argv and sys.argv[sys.argv.index("--effort") + 1] == "low"
 prompt = sys.stdin.read()
-assert "Hello" in prompt and "Goodbye" in prompt
+if os.environ.get("FAKE_EXPECT_PARAKEET"):
+    assert "Workhive." in prompt
+else:
+    assert "Hello" in prompt and "Goodbye" in prompt
+if os.environ.get("FAKE_EXPECT_NAME"):
+    assert "Spell these names exactly as written: Workhive." in prompt
 if os.environ.get("FAKE_GROK_FAIL"):
     sys.exit(1)
 print(json.dumps({"text":json.dumps({"title":"A better name",
@@ -153,6 +183,8 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         cls.http.fail_create = False
         cls.http.fail_ai = False
         cls.http.whisper_started = cls.directory / "whisper-started"
+        cls.model = cls.directory / "parakeet-model"
+        cls.model.mkdir()
         cls.thread = threading.Thread(target=cls.http.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -174,6 +206,8 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         self.http.fail_create = False
         self.http.fail_ai = False
         self.http.whisper_started.unlink(missing_ok=True)
+        self.config = self.directory / "config" / "omashare" / "config.json"
+        self.config.unlink(missing_ok=True)
 
     def run_upload(self, *args, fail=False, whisper="whisper", extra_env=None,
                    expected_returncode=0, timeout=30):
@@ -182,6 +216,8 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
                     "OMASHARE_SERVER": f"http://127.0.0.1:{self.http.server_port}",
                     "OMASHARE_KEY": "test-key",
                     "OMASHARE_WHISPER_PYTHON": str(self.bin / whisper),
+                    "OMASHARE_SPEECH_PYTHON": str(self.bin / "absent-parakeet"),
+                    "XDG_CONFIG_HOME": str(self.directory / "config"),
                     "OMASHARE_WRITER": "grok"})
         if extra_env:
             env.update(extra_env)
@@ -280,6 +316,70 @@ print(json.dumps({"text":json.dumps({"title":"A better name",
         payload = next(body for _, path, body in FakeServer.requests
                        if path == "/api/desktop/video/ai-content")
         self.assertIn("Noisy", payload["vtt"])
+
+    def test_parakeet_precedes_whisper_and_posts_cues(self):
+        events = self.run_upload(
+            whisper="absent-whisper",
+            extra_env={"OMASHARE_SPEECH_PYTHON": str(self.bin / "parakeet"),
+                       "OMASHARE_PARAKEET_MODEL": str(self.model),
+                       "FAKE_EXPECT_PARAKEET": "1"},
+        )
+        self.assertEqual(events[-1]["event"], "done")
+        payload = next(body for _, path, body in FakeServer.requests
+                       if path == "/api/desktop/video/ai-content")
+        self.assertIn("Workhive.", payload["vtt"])
+        self.assertIn("Next topic!", payload["vtt"])
+
+    def test_parakeet_piece_offsets_and_progress(self):
+        wav = self.directory / "long-silence.wav"
+        with wave.open(str(wav), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            for _ in range(61):
+                audio.writeframes(b"\x00" * 320000)
+        percentages = []
+        env = os.environ.copy()
+        env["PATH"] = f"{self.bin}:{env['PATH']}"
+        cues = share.transcribe_parakeet(
+            str(wav), 610, str(self.bin / "parakeet"), str(self.model),
+            str(self.directory), env, None, percentages.append,
+        )
+        self.assertEqual([round(cue[0]) for cue in cues], [0, 1, 300, 301, 600, 601])
+        self.assertEqual([round(value) for value in percentages], [49, 98, 100])
+        self.assertEqual(cues[0][2], "Workhive.")
+        self.assertEqual(cues[1][2], "Next topic!")
+        wav.unlink()
+
+    def test_names_replacement_and_prompt(self):
+        cues = [(0, 2, "WorkHive, work hive, Work-hive, workhives and Networkhive.")]
+        corrected = share.correct_names(cues, ["Workhive"])
+        self.assertEqual(corrected[0][2],
+                         "Workhive, Workhive, Workhive, workhives and Networkhive.")
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps({"server": "local", "api_key": "secret",
+                                            "names": ["Workhive"]}))
+        events = self.run_upload(extra_env={"FAKE_EXPECT_NAME": "1"})
+        self.assertEqual(events[-1]["event"], "done")
+
+    def test_names_commands_preserve_credentials(self):
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(json.dumps({"server": "local", "api_key": "secret"}))
+        env = os.environ.copy()
+        env["XDG_CONFIG_HOME"] = str(self.directory / "config")
+        def command(*args):
+            return subprocess.run([str(ROOT / "omashare"), "names", *args], env=env,
+                                  capture_output=True, text=True, check=True).stdout
+
+        command("add", "Workhive")
+        command("add", "workhive")
+        self.assertEqual(command(), "Workhive\n")
+        self.assertEqual(json.loads(self.config.read_text()),
+                         {"server": "local", "api_key": "secret", "names": ["Workhive"]})
+        command("remove", "Workhive")
+        self.assertEqual(command(), "")
+        self.assertEqual(json.loads(self.config.read_text()),
+                         {"server": "local", "api_key": "secret", "names": []})
 
 
 if __name__ == "__main__":
