@@ -311,6 +311,129 @@ for segment in segments:
     print(json.dumps({"progress": min(100, segment.end / duration * 100)}), flush=True)
 """
 
+PARAKEET_SCRIPT = """
+import json
+import sys
+import onnx_asr
+model = onnx_asr.load_model("nemo-parakeet-tdt-0.6b-v3", path=sys.argv[1],
+                            quantization="int8").with_timestamps()
+for audio in sys.argv[2:]:
+    result = model.recognize(audio)
+    print(json.dumps({"tokens": result.tokens or [],
+                      "timestamps": result.timestamps or []}), flush=True)
+"""
+
+
+def parakeet_setup():
+    python = os.environ.get("OMASHARE_SPEECH_PYTHON",
+                           os.path.expanduser("~/.local/share/omaedit/addons/words/venv/bin/python"))
+    model = os.environ.get("OMASHARE_PARAKEET_MODEL",
+                          os.path.expanduser("~/.local/share/omaedit/addons/words/models/parakeet"))
+    return (python, model) if os.path.isfile(python) and os.path.isdir(model) else (None, None)
+
+
+def parakeet_words(tokens, timestamps, duration):
+    """Join sub-word pieces using Omaedit's space-and-letter word boundary."""
+    words = []
+    current = None
+    for token, start in zip(tokens, timestamps):
+        text = token.strip()
+        if not text:
+            continue
+        starts_word = token[:1].isspace() and any(char.isalnum() for char in text)
+        if current is None or starts_word:
+            if current:
+                words.append(current)
+            current = {"text": text, "start": float(start), "last": float(start)}
+        else:
+            current["text"] += text
+            if any(char.isalnum() for char in text):
+                current["last"] = float(start)
+    if current:
+        words.append(current)
+    result = []
+    for index, word in enumerate(words):
+        start = max(0.0, word["start"])
+        end = max(start + 0.04, word["last"] + 0.08)
+        if index + 1 < len(words):
+            end = min(end, words[index + 1]["start"])
+        end = min(end, duration)
+        if end > start:
+            result.append((start, end, word["text"]))
+    return result
+
+
+def words_to_cues(words):
+    cues = []
+    group = []
+    for start, end, text in words:
+        group.append((start, end, text))
+        content = " ".join(word for _, _, word in group)
+        if text.endswith((".", "?", "!")) or end - group[0][0] >= 7 or len(content) >= 84:
+            cues.append((group[0][0], end, content))
+            group = []
+    if group:
+        cues.append((group[0][0], group[-1][1], " ".join(word for _, _, word in group)))
+    return cues
+
+
+def run_speech(cmd, workdir, env, job, on_item):
+    stderr_path = os.path.join(workdir, "speech.stderr")
+    if shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=3G", "--quiet", *cmd]
+    with open(stderr_path, "wb") as stderr:
+        proc = (job or TranscriptionJob()).start(
+            cmd, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env,
+            start_new_session=True,
+        )
+        if proc is None:
+            return
+        with proc:
+            for line in proc.stdout:
+                on_item(json.loads(line))
+            if proc.wait():
+                with open(stderr_path, "rb") as log:
+                    log.seek(0, os.SEEK_END)
+                    log.seek(max(0, log.tell() - 400))
+                    tail = log.read().decode(errors="replace").strip()
+                raise ShareError(f"Speech recognition failed: {tail}")
+
+
+def transcribe_parakeet(wav, duration, python, model, workdir, env, job, on_progress):
+    pieces = []
+    if duration <= 300:
+        pieces.append((wav, 0, duration))
+    else:
+        for index in range(int((duration - 0.001) // 300) + 1):
+            offset = index * 300
+            length = min(300, duration - offset)
+            piece = os.path.join(workdir, f"speech-{index}.wav")
+            split = subprocess.run(
+                ["ffmpeg", "-v", "error", "-y", "-ss", str(offset), "-t", str(length),
+                 "-i", wav, "-c:a", "copy", piece], capture_output=True, text=True,
+            )
+            if split.returncode:
+                raise ShareError(f"Couldn't split audio: {split.stderr.strip()[-300:]}")
+            if job and job.cancelled:
+                return []
+            pieces.append((piece, offset, length))
+    env["HF_HUB_OFFLINE"] = "1"
+    cues = []
+    def receive(item):
+        index = len(received)
+        _, offset, length = pieces[index]
+        words = parakeet_words(item["tokens"], item["timestamps"], length)
+        cues.extend((start + offset, end + offset, text)
+                    for start, end, text in words_to_cues(words))
+        received.append(True)
+        if on_progress:
+            on_progress(min(100, (offset + length) / max(duration, 0.001) * 100))
+
+    received = []
+    run_speech([python, "-u", "-c", PARAKEET_SCRIPT, model,
+                *(piece for piece, _, _ in pieces)], workdir, env, job, receive)
+    return cues
+
 
 def whisper_setup():
     settings = {}
@@ -365,8 +488,9 @@ def get_transcript(path, meta, workdir, transcript=None, on_progress=None, job=N
         return parse_transcript(source)
     if not meta["acodec"]:
         return None
-    python, model = whisper_setup()
-    if not python:
+    parakeet_python, parakeet_model = parakeet_setup()
+    python, model = (None, None) if parakeet_python else whisper_setup()
+    if not parakeet_python and not python:
         return None
     wav = os.path.join(workdir, "speech.wav")
     extracted = subprocess.run(
@@ -381,33 +505,20 @@ def get_transcript(path, meta, workdir, transcript=None, on_progress=None, job=N
     hf_home = os.path.expanduser("~/.local/share/omaedit/speech/hf")
     if os.path.isdir(hf_home):
         env["HF_HOME"] = hf_home
+    if parakeet_python:
+        return transcribe_parakeet(wav, meta["duration"], parakeet_python, parakeet_model,
+                                   workdir, env, job, on_progress)
     cmd = [python, "-u", "-c", WHISPER_SCRIPT, str(model), wav,
            str(max(meta["duration"], 0.001))]
-    if shutil.which("systemd-run"):
-        cmd = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=3G", "--quiet", *cmd]
     cues = []
-    stderr_path = os.path.join(workdir, "whisper.stderr")
-    with open(stderr_path, "wb") as stderr:
-        proc = (job or TranscriptionJob()).start(
-            cmd, stdout=subprocess.PIPE, stderr=stderr, text=True, env=env,
-            start_new_session=True,
-        )
-        if proc is None:
-            return None
-        with proc:
-            for line in proc.stdout:
-                item = json.loads(line)
-                if "progress" in item:
-                    if on_progress:
-                        on_progress(float(item["progress"]))
-                else:
-                    cues.append((float(item["start"]), float(item["end"]), item["text"]))
-            if proc.wait():
-                with open(stderr_path, "rb") as log:
-                    log.seek(0, os.SEEK_END)
-                    log.seek(max(0, log.tell() - 400))
-                    tail = log.read().decode(errors="replace").strip()
-                raise ShareError(f"Whisper failed: {tail}")
+    def receive(item):
+        if "progress" in item:
+            if on_progress:
+                on_progress(float(item["progress"]))
+        else:
+            cues.append((float(item["start"]), float(item["end"]), item["text"]))
+
+    run_speech(cmd, workdir, env, job, receive)
     return cues
 
 
