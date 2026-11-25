@@ -609,7 +609,7 @@ def write_details(cues, duration, fallback_name):
         + "\n".join(f"[{start:g}] {text}" for start, _, text in cues)
     )
     # Both CLIs accept the prompt on stdin, avoiding the OS argument-length limit.
-    cmd = (["grok", "-p", "--disable-web-search", "--output-format", "json",
+    cmd = (["grok", "-p", "--effort", "low", "--disable-web-search", "--output-format", "json",
             "--json-schema", json.dumps(DETAILS_SCHEMA)]
            if writer == "grok" else
            ["claude", "-p", "--output-format", "json", "--model", "haiku"])
