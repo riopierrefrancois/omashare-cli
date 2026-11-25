@@ -169,6 +169,33 @@ def cmd_logout():
     print("Signed out (server address kept).", file=sys.stderr)
 
 
+def cmd_names(action=None, name=None):
+    cfg = load_config()
+    names = cfg.get("names", [])
+    if action == "add":
+        if not any(existing.casefold() == name.casefold() for existing in names):
+            names.append(name)
+    elif action == "remove":
+        names = [existing for existing in names if existing.casefold() != name.casefold()]
+    else:
+        for entry in names:
+            print(entry)
+        return
+    cfg["names"] = names
+    save_config(cfg)
+
+
+def correct_names(cues, names):
+    """Canonicalize names in transcript cues without changing partial words."""
+    for name in sorted(names, key=len, reverse=True):
+        letters = [re.escape(char) for char in name if char not in " -"]
+        if not letters:
+            continue
+        pattern = re.compile(r"(?<!\w)" + r"[ -]?".join(letters) + r"(?!\w)", re.IGNORECASE)
+        cues = [(start, end, pattern.sub(lambda _: name, text)) for start, end, text in cues]
+    return cues
+
+
 # ---------- media ----------
 
 def probe(path):
@@ -565,6 +592,7 @@ def write_details(cues, duration, fallback_name):
     if writer not in ("grok", "claude"):
         warn(f"Unknown writer {writer}; skipping summary.")
         return None
+    names = load_config().get("names", [])
     prompt = (
         "You are naming a video someone is about to share with a link. "
         f"Below is its transcript with start times in seconds. Video length: {duration} seconds.\n"
@@ -575,7 +603,9 @@ def write_details(cues, duration, fallback_name):
         "the first starts at 0, each at least 30 seconds after the previous, "
         "starts are whole seconds taken from the transcript, short plain titles). "
         "Use the speaker's own words where you can. Shorter videos: chapters is an empty list.\n"
-        "Transcript:\n"
+        + (f"Spell these names exactly as written: {', '.join(names)}.\n"
+           if names else "")
+        + "Transcript:\n"
         + "\n".join(f"[{start:g}] {text}" for start, _, text in cues)
     )
     # Both CLIs accept the prompt on stdin, avoiding the OS argument-length limit.
@@ -731,6 +761,7 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
                 warn("No transcript: Whisper isn't set up on this computer.")
         cues = result.get("cues")
         if cues:
+            cues = correct_names(cues, load_config().get("names", []))
             details = write_details(cues, meta["duration"], title)
             body = {"videoId": video_id, "vtt": build_vtt(cues)}
             if details:
@@ -760,7 +791,7 @@ def cmd_upload(path, name, copy, transcript=None, no_details=False, keep_name=Fa
 def main():
     global JSON_MODE
     argv = sys.argv[1:]
-    commands = {"login", "logout", "status", "upload"}
+    commands = {"login", "logout", "status", "upload", "names"}
     # `omashare [--json] [--name T] FILE` is the short form of `omashare [--json] upload [--name T] FILE`.
     # "upload" goes right after the global flags, so upload's own options (--name, --no-copy) follow it.
     global_flags = {"--json", "--version", "-h", "--help"}
@@ -776,6 +807,9 @@ def main():
     lp.add_argument("server", nargs="?", help=f"server address (default {DEFAULT_SERVER})")
     sub.add_parser("logout", help="forget the saved key")
     sub.add_parser("status", help="show server and account")
+    names = sub.add_parser("names", help="list or edit spellings used in transcripts")
+    names.add_argument("action", nargs="?", choices=("add", "remove"))
+    names.add_argument("name", nargs="?", help="name to add or remove")
     up = sub.add_parser("upload", help="upload a video and print its link")
     up.add_argument("file")
     up.add_argument("--name", help="fallback title (default: file name)")
@@ -785,6 +819,8 @@ def main():
     up.add_argument("--no-copy", action="store_true", help="don't copy the link")
     up.add_argument("--json", action="store_true", dest="json_sub", help=argparse.SUPPRESS)
     args = p.parse_args(argv)
+    if args.cmd == "names" and bool(args.action) != bool(args.name):
+        names.error("add and remove require a NAME")
     JSON_MODE = args.json or getattr(args, "json_sub", False)
 
     try:
@@ -794,6 +830,8 @@ def main():
             cmd_logout()
         elif args.cmd == "status":
             cmd_status()
+        elif args.cmd == "names":
+            cmd_names(args.action, args.name)
         elif args.cmd == "upload":
             cmd_upload(args.file, args.name, not args.no_copy, args.transcript,
                        args.no_details, args.keep_name)

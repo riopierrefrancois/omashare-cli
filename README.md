@@ -13,6 +13,9 @@ omashare talk.mov --name "Weekly update"   # fallback title; AI replaces it
 omashare talk.mp4 --transcript talk.srt     # use an existing transcript
 omashare talk.mp4 --keep-name              # keep the file name instead of the AI title
 omashare talk.mp4 --no-details             # upload only, no transcript or AI
+omashare names add "Workhive"              # keep this spelling in transcript and AI
+omashare names                            # list saved names
+omashare names remove "Workhive"
 omashare status                            # which server and account
 omashare logout
 ```
@@ -27,6 +30,7 @@ and model (or `OMASHARE_WHISPER_PYTHON` and `OMASHARE_WHISPER_MODEL`; default
 model `small.en`). `OMASHARE_WRITER=grok` is the default; set it to `claude` or
 `off` to use Claude Haiku or skip AI writing. Missing tools only skip the
 transcript or summary; they do not fail the upload.
+Names are saved alongside the server and key in `~/.config/omashare/config.json`.
 
 ## Install (Arch / Omarchy)
 
