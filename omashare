@@ -18,6 +18,7 @@ import http.client
 import http.server
 import json
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -62,6 +63,13 @@ def progress(stage, percent):
     else:
         sys.stderr.write(f"\r{stage.capitalize()}… {percent:5.1f}%")
         sys.stderr.flush()
+
+
+def warn(message):
+    if JSON_MODE:
+        emit({"event": "warning", "message": message})
+    else:
+        say(f"Warning: {message}")
 
 
 # ---------- config ----------
@@ -427,7 +435,7 @@ def upload_thumbnail(server, key, video_id, path, meta, workdir):
             say(f"No thumbnail: {e}")
 
 
-def cmd_upload(path, name, copy):
+def cmd_upload(path, name, copy, transcript=None, no_details=False):
     if not os.path.isfile(path):
         raise ShareError(f"No such file: {path}")
     server, key = credentials()
@@ -436,19 +444,49 @@ def cmd_upload(path, name, copy):
 
     with tempfile.TemporaryDirectory(prefix="omashare-") as work:
         mp4 = prepare(path, meta, work)
-        dims = {
-            "durationInSecs": round(meta["duration"], 3),
-            "width": meta["width"],
-            "height": meta["height"],
-            "fps": meta["fps"],
-        }
-        created = api(server, key, "GET", "/api/desktop/video/create",
-                      query={"recordingMode": "desktopMP4", "name": title, **dims})
-        video_id = created["id"]
-        signed = api(server, key, "POST", "/api/upload/signed",
-                     body={"videoId": video_id, "subpath": "result.mp4", "method": "put", **dims})
-        put_file(signed["presignedPutData"]["url"], mp4)
-        upload_thumbnail(server, key, video_id, mp4, meta, work)
+        result = {}
+        updates = queue.Queue()
+        worker = None
+        if not no_details:
+            def transcribe():
+                try:
+                    result["cues"] = get_transcript(
+                        path, meta, work, transcript, updates.put,
+                    )
+                except Exception as e:
+                    result["error"] = str(e)
+
+            worker = threading.Thread(target=transcribe)
+            worker.start()
+        try:
+            dims = {
+                "durationInSecs": round(meta["duration"], 3),
+                "width": meta["width"],
+                "height": meta["height"],
+                "fps": meta["fps"],
+            }
+            created = api(server, key, "GET", "/api/desktop/video/create",
+                           query={"recordingMode": "desktopMP4", "name": title, **dims})
+            video_id = created["id"]
+            signed = api(server, key, "POST", "/api/upload/signed",
+                          body={"videoId": video_id, "subpath": "result.mp4", "method": "put", **dims})
+            put_file(signed["presignedPutData"]["url"], mp4)
+            upload_thumbnail(server, key, video_id, mp4, meta, work)
+        finally:
+            if worker:
+                if worker.is_alive():
+                    progress("transcribing", 0.0)
+                while worker.is_alive():
+                    try:
+                        percent = updates.get(timeout=0.2)
+                        progress("transcribing", percent)
+                    except queue.Empty:
+                        pass
+                worker.join()
+                if "error" in result:
+                    warn(f"Couldn't transcribe: {result['error']}")
+                elif result.get("cues") is None and meta["acodec"] and not transcript:
+                    warn("No transcript: Whisper isn't set up on this computer.")
 
     link = created.get("share_url") or f"{server}/s/{video_id}"
     if copy and shutil.which("wl-copy"):
