@@ -9,7 +9,10 @@ The server is [Cap Web](https://github.com/CapSoftware/Cap) (self-hosted). It gi
 ```sh
 omashare login https://share.example.com   # once; opens your browser to sign in
 omashare talk.mp4                          # uploads, prints the link, copies it
-omashare talk.mov --name "Weekly update"   # set the title on the share page
+omashare talk.mov --name "Weekly update"   # fallback title; AI replaces it
+omashare talk.mp4 --transcript talk.srt     # use an existing transcript
+omashare talk.mp4 --keep-name              # keep the file name instead of the AI title
+omashare talk.mp4 --no-details             # upload only, no transcript or AI
 omashare status                            # which server and account
 omashare logout
 ```
@@ -18,7 +21,12 @@ Any video ffmpeg can read works. MP4 files with H.264 and AAC go up as they are.
 
 The key is saved in `~/.config/omashare/config.json` (readable only by you). `OMASHARE_SERVER` and `OMASHARE_KEY` override it.
 
-Needs `python3` and `ffmpeg`. `wl-copy` is optional; it copies the link.
+Needs `python3` and `ffmpeg`. `wl-copy` is optional; it copies the link. When there is
+no sidecar VTT/SRT transcript, transcription uses Omaedit's faster-whisper Python
+and model (or `OMASHARE_WHISPER_PYTHON` and `OMASHARE_WHISPER_MODEL`; default
+model `small.en`). `OMASHARE_WRITER=grok` is the default; set it to `claude` or
+`off` to use Claude Haiku or skip AI writing. Missing tools only skip the
+transcript or summary; they do not fail the upload.
 
 ## Install (Arch / Omarchy)
 
@@ -40,11 +48,18 @@ Run `omashare --json [--name TITLE] FILE` and read stdout line by line. Each lin
 ```json
 {"event": "progress", "stage": "preparing", "percent": 37.5}
 {"event": "progress", "stage": "uploading", "percent": 81.2}
-{"event": "done", "id": "kxed3ytz2z7ht2t", "link": "https://share.example.com/s/kxed3ytz2z7ht2t"}
+{"event": "progress", "stage": "transcribing", "percent": 50.0}
+{"event": "progress", "stage": "writing", "percent": 0.0}
+{"event": "progress", "stage": "writing", "percent": 100.0}
+{"event": "warning", "message": "Couldn't write a summary: Grok didn't answer."}
+{"event": "done", "id": "kxed3ytz2z7ht2t", "link": "https://share.example.com/s/kxed3ytz2z7ht2t", "title": "Weekly update"}
 {"event": "error", "error": "Not signed in. Run: omashare login"}
 ```
 
-The exit code is 0 on success and 1 on error. The link is already on the clipboard when `done` arrives; pass `--no-copy` to skip that.
+`transcribing` appears only if transcription continues after upload. `warning`
+means a details step was skipped but the upload succeeded. The exit code is 0
+on success and 1 on upload error. The link is already on the clipboard when
+`done` arrives; pass `--no-copy` to skip that.
 
 ## How it talks to the server
 
@@ -54,6 +69,8 @@ It does what Cap's own desktop app and CLI do:
 2. `GET /api/desktop/video/create?recordingMode=desktopMP4&name=…` creates the video and returns its id and share link.
 3. `POST /api/upload/signed` with `subpath: "result.mp4"` returns a presigned storage URL.
 4. `PUT` the MP4 to that URL.
+5. `POST /api/desktop/video/ai-content` sends the WEBVTT and any written
+   title, summary, and chapters.
 
 ## Local test server
 
